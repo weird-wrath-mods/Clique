@@ -322,19 +322,20 @@ local function clique_ensureDebugWindow()
 		clique_dbg("--- snapshot ---")
 		clique_dbg("combat=", tostring(InCombatLockdown()), "targeting(api)=", tostring(SpellIsTargeting()))
 		local n = 0
+		local probed = 0
 		for fr, enabled in pairs(Clique.ccframes or {}) do
 			if enabled and type(fr) == "table" then
 				n = n + 1
-				if n <= 6 then
+				if fr:GetAttribute("probe-self-canary") ~= nil then
+					probed = probed + 1
 					clique_dbg("frame", fr:GetName() or tostring(fr),
-						"targeting(attr)=", tostring(fr:GetAttribute("clique-targeting")),
-						"type1=", tostring(fr:GetAttribute("type1")),
-						"Shift-type1=", tostring(fr:GetAttribute("Shift-type1")),
-						"hooked=", tostring(fr.__clique_hooked))
+						"self-canary=", tostring(fr:GetAttribute("probe-self-canary")),
+						"hr-type=", tostring(fr:GetAttribute("probe-hr-type")),
+						"hr-attr=", tostring(fr:GetAttribute("probe-hr-attr")))
 				end
 			end
 		end
-		clique_dbg("total managed frames:", n)
+		clique_dbg("total managed frames:", n, "probed:", probed)
 	end)
 
 	local scroll = CreateFrame("ScrollFrame", "CliqueDebugScroll", f, "UIPanelScrollFrameTemplate")
@@ -386,35 +387,68 @@ SlashCmdList["CLIQUEDBG"] = function(msg)
 end
 
 local cliqueSecureHeader = CreateFrame("Frame", "CliqueSecureHeader", UIParent, "SecureHandlerBaseTemplate")
+-- Seed canaries so the probe snippet can detect which access patterns work.
+cliqueSecureHeader:SetAttribute("probe-canary-header", "HEADER-OK")
 
+-- PreClick snippet: dynamically build the macrotext for this click.
+-- Resolves the unit from the frame's "unit" attribute at click time so it
+-- works for dynamic-unit frameworks (Grid2 etc.). Reads the saved focus name
+-- from the header so it can restore focus even after in-combat focus changes.
 local PRECLICK_SNIPPET = [[
-    if self:GetAttribute("clique-targeting") then
-        local btn
-        if button == "LeftButton" then btn = "1"
-        elseif button == "RightButton" then btn = "2"
-        elseif button == "MiddleButton" then btn = "3"
-        else btn = string.match(button or "", "^Button(%d+)$") end
-        if btn then
-            local prefix = ""
-            if IsShiftKeyDown() then prefix = "Shift-"..prefix end
-            if IsControlKeyDown() then prefix = "Ctrl-"..prefix end
-            if IsAltKeyDown() then prefix = "Alt-"..prefix end
-            local attr = prefix.."type"..btn
-            self:SetAttribute("clique-saved-attr", attr)
-            self:SetAttribute("clique-saved-type", self:GetAttribute(attr))
-            self:SetAttribute(attr, nil)
+    local btn
+    if button == "LeftButton" then btn = "1"
+    elseif button == "RightButton" then btn = "2"
+    elseif button == "MiddleButton" then btn = "3"
+    else btn = string.match(button or "", "^Button(%d+)$") end
+    if not btn then return end
+
+    local prefix = ""
+    if IsShiftKeyDown() then prefix = "Shift-"..prefix end
+    if IsControlKeyDown() then prefix = "Ctrl-"..prefix end
+    if IsAltKeyDown() then prefix = "Alt-"..prefix end
+
+    local spell = self:GetAttribute("clique-spell-"..prefix..btn)
+    if not spell then return end
+
+    local unit = self:GetAttribute(prefix.."unit"..btn) or self:GetAttribute("unit")
+    if not unit or unit == "" or unit == "target" then return end
+
+    local saved
+    local header = self:GetFrameRef("header")
+    if header then saved = header:GetAttribute("clique-saved-focus-name") end
+
+    local tail
+    if saved and saved ~= "" then
+        tail = "/target focus\n/focus "..saved
+    else
+        tail = "/target focus\n/clearfocus"
+    end
+
+    local mt = "/focus target\n/target "..unit.."\n/cast [@"..unit.."] "..spell.."\n"..tail
+    self:SetAttribute(prefix.."macrotext"..btn, mt)
+
+    -- Still apply the original cursor-priority routing so the click works.
+    local btn
+    if button == "LeftButton" then btn = "1"
+    elseif button == "RightButton" then btn = "2"
+    elseif button == "MiddleButton" then btn = "3"
+    else btn = string.match(button or "", "^Button(%d+)$") end
+    if btn then
+        local prefix = ""
+        if IsShiftKeyDown() then prefix = "Shift-"..prefix end
+        if IsControlKeyDown() then prefix = "Ctrl-"..prefix end
+        if IsAltKeyDown() then prefix = "Alt-"..prefix end
+        local source_key = UnitExists("focus")
+            and ("clique-mt-focus-"..prefix..btn)
+            or ("clique-mt-nofocus-"..prefix..btn)
+        local mt = self:GetAttribute(source_key)
+        if mt then
+            self:SetAttribute(prefix.."macrotext"..btn, mt)
         end
     end
 ]]
 
-local POSTCLICK_SNIPPET = [[
-    local attr = self:GetAttribute("clique-saved-attr")
-    if attr then
-        self:SetAttribute(attr, self:GetAttribute("clique-saved-type"))
-        self:SetAttribute("clique-saved-attr", nil)
-        self:SetAttribute("clique-saved-type", nil)
-    end
-]]
+local POSTCLICK_SNIPPET = ""
 
 -- Insecure PreClick: if a spell is pending on the cursor, fire it on the unit
 -- immediately, BEFORE the protected secure dispatch runs. This starts the pending
@@ -470,10 +504,22 @@ cliqueStateFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 cliqueStateFrame:RegisterEvent("SPELLCAST_STOP")
 cliqueStateFrame:RegisterEvent("SPELLCAST_FAILED")
 cliqueStateFrame:RegisterEvent("SPELLCAST_INTERRUPTED")
+cliqueStateFrame:RegisterEvent("PLAYER_FOCUS_CHANGED")
+
+-- Mirror the player's focus identity onto the header so the PreClick
+-- snippet can bake it into the macrotext. The header is unprotected so
+-- SetAttribute works from insecure code even in combat.
+local function update_saved_focus()
+	cliqueSecureHeader:SetAttribute("clique-saved-focus-name", UnitName("focus") or "")
+end
 cliqueStateFrame:SetScript("OnEvent", function(self, event)
+	if event == "PLAYER_FOCUS_CHANGED" or event == "PLAYER_ENTERING_WORLD" then
+		update_saved_focus()
+	end
 	local targeting = SpellIsTargeting() and true or false
 	clique_dbg("state event", event, "targeting=", tostring(targeting),
-		"last=", tostring(cliqueLastTargeting), "combat=", tostring(InCombatLockdown()))
+		"last=", tostring(cliqueLastTargeting), "combat=", tostring(InCombatLockdown()),
+		"saved-focus=", tostring(cliqueSecureHeader:GetAttribute("clique-saved-focus-name")))
 	if targeting == cliqueLastTargeting then return end
 	cliqueLastTargeting = targeting
 	local count = tonumber(cliqueSecureHeader:GetAttribute("clique-frame-count")) or 0
@@ -543,6 +589,10 @@ function Clique:RegisterFrame(frame)
 		if okRef then
 			cliqueSecureHeader:SetAttribute("clique-frame-count", n)
 		end
+
+		-- Probe canaries
+		frame:SetAttribute("probe-canary-self", "SELF-OK")
+		local okSelfRef = pcall(SecureHandlerSetFrameRef, frame, "header", cliqueSecureHeader)
 
 		frame.__clique_hooked = true
 		clique_dbg("RegisterFrame hook", frame:GetName() or tostring(frame), "idx=", n,
@@ -719,26 +769,16 @@ function Clique:SetAttribute(entry, frame)
 		-- skips and main target stays put. Focus is untouched.
 		local unit = SecureButton_GetModifiedUnit(frame, entry.modifier.."unit"..button)
 			or frame:GetAttribute("unit")
-		if unit and unit ~= "" and unit ~= "target" then
-			-- /target triggers cursor consumption if a spell is pending (engine
-			-- starts the cast, [casting] becomes true). In the bound case it
-			-- just changes target. /targetlasttarget [nocasting] therefore only
-			-- runs in the bound case, restoring the prior target before /cast
-			-- fires. /cast [@unit] sends the bound spell to the clicked unit
-			-- regardless of where main target ended up.
-			local macro = string.format(
-				"/target %s\n/targetlasttarget [nocasting]\n/cast [@%s] %s",
-				unit, unit, cast)
-			frame:SetAttribute(entry.modifier.."type"..button, "macro")
-			frame:SetAttribute(entry.modifier.."macrotext"..button, macro)
-			frame:SetAttribute(entry.modifier.."macro"..button, nil)
-			frame:SetAttribute(entry.modifier.."spell"..button, nil)
-		else
-			-- Fallback: no resolvable unit (or unit == "target", where retargeting
-			-- would be a no-op). Use the original type="spell" path.
-			frame:SetAttribute(entry.modifier.."type"..button, entry.type)
-			frame:SetAttribute(entry.modifier.."spell"..button, cast)
-		end
+		-- Store the bound spell as a custom attribute. The PreClick snippet
+		-- reads it at click time, resolves the unit from the frame's "unit"
+		-- attribute (dynamic for Grid2 / SecureGroupHeader frames), and
+		-- builds the macrotext on the fly. type=macro with an empty default
+		-- macrotext that the snippet fills in.
+		frame:SetAttribute("clique-spell-"..entry.modifier..button, cast)
+		frame:SetAttribute(entry.modifier.."type"..button, "macro")
+		frame:SetAttribute(entry.modifier.."macrotext"..button, "")
+		frame:SetAttribute(entry.modifier.."macro"..button, nil)
+		frame:SetAttribute(entry.modifier.."spell"..button, nil)
 
 		frame:SetAttribute(entry.modifier.."bag"..button, entry.arg2)
 		frame:SetAttribute(entry.modifier.."slot"..button, entry.arg3)
