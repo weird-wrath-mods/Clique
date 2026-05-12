@@ -417,14 +417,23 @@ local PRECLICK_SNIPPET = [[
     local header = self:GetFrameRef("header")
     if header then saved = header:GetAttribute("clique-saved-focus-name") end
 
-    local tail
+    -- Restore step: if focus is set (we set it from a real prior target),
+    -- /target focus restores. Else (no prior target), /cleartarget. Finally
+    -- restore the user's pre-existing focus by name if we have one saved.
+    local focus_tail
     if saved and saved ~= "" then
-        tail = "/target focus\n/focus "..saved
+        focus_tail = "/focus "..saved
     else
-        tail = "/target focus\n/clearfocus"
+        focus_tail = "/clearfocus"
     end
 
-    local mt = "/focus target\n/target "..unit.."\n/cast [@"..unit.."] "..spell.."\n"..tail
+    local mt = "/clearfocus\n"
+        .."/focus [target] target\n"
+        .."/target "..unit.."\n"
+        .."/cast [@"..unit.."] "..spell.."\n"
+        .."/target [@focus,exists] focus\n"
+        .."/cleartarget [@focus,noexists]\n"
+        ..focus_tail
     self:SetAttribute(prefix.."macrotext"..btn, mt)
 
     -- Still apply the original cursor-priority routing so the click works.
