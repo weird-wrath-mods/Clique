@@ -16,6 +16,7 @@ if GetLocale() then
 	L.CLICKSET_DEFAULT        = "Default"
 	L.CLICKSET_HARMFUL        = "Harmful actions"
 	L.CLICKSET_HELPFUL        = "Helpful actions"
+	L.CLICKSET_DEAD           = "Dead target"
 	L.CLICKSET_OOC            = "Out of Combat"
 	L.CLICKSET_BEARFORM       = "Bear Form"
 	L.CLICKSET_CATFORM        = "Cat Form"

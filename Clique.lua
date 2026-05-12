@@ -22,6 +22,7 @@ function Clique:Enable()
 				[L.CLICKSET_DEFAULT] = {},
 				[L.CLICKSET_HARMFUL] = {},
 				[L.CLICKSET_HELPFUL] = {},
+				[L.CLICKSET_DEAD] = {},
 				[L.CLICKSET_OOC] = {},
 			},
 			blacklist = {
@@ -165,6 +166,7 @@ function Clique:SpellBookButtonPressed(frame, button)
     
     local type = "spell"
 
+	local isDead = (self.editSet == self.clicksets[L.CLICKSET_DEAD])
 	if self.editSet == self.clicksets[L.CLICKSET_HARMFUL] then
 		button = string.format("%s%d", "harmbutton", self:GetButtonNumber(button))
 	elseif self.editSet == self.clicksets[L.CLICKSET_HELPFUL] then
@@ -172,7 +174,7 @@ function Clique:SpellBookButtonPressed(frame, button)
 	else
 		button = self:GetButtonNumber(button)
 	end
-   
+
 	-- Clear the rank if "Show all spell ranks" is selected
 	if not GetCVarBool("ShowAllSpellRanks") then
 		rank = nil
@@ -186,6 +188,7 @@ function Clique:SpellBookButtonPressed(frame, button)
 		["type"] = type,
 		["arg1"] = name,
 		["arg2"] = rank,
+		["dead"] = isDead or nil,
     }
     
     local key = t.modifier .. t.button
@@ -207,6 +210,7 @@ function Clique:PLAYER_REGEN_ENABLED()
 	self:ApplyClickSet(L.CLICKSET_DEFAULT)
 	self:RemoveClickSet(L.CLICKSET_HARMFUL)
 	self:RemoveClickSet(L.CLICKSET_HELPFUL)
+	self:RemoveClickSet(L.CLICKSET_DEAD)
 	self:ApplyClickSet(self.ooc)
 end
 
@@ -216,12 +220,14 @@ function Clique:PLAYER_REGEN_DISABLED()
 	self:ApplyClickSet(L.CLICKSET_DEFAULT)
 	self:ApplyClickSet(L.CLICKSET_HARMFUL)
 	self:ApplyClickSet(L.CLICKSET_HELPFUL)
+	self:ApplyClickSet(L.CLICKSET_DEAD)
 end
 
 function Clique:UpdateClicks()
 	local ooc = self.clicksets[L.CLICKSET_OOC]
 	local harm = self.clicksets[L.CLICKSET_HARMFUL]
 	local help = self.clicksets[L.CLICKSET_HELPFUL]
+	local dead = self.clicksets[L.CLICKSET_DEAD]
 
     -- Since harm/help buttons take priority over any others, we can't
     --
@@ -255,140 +261,22 @@ function Clique:UpdateClicks()
             table.insert(self.ooc, entry)
         end
     end
-	
+
+    for name, entry in pairs(dead) do
+        local key = string.format("%s:%s", entry.modifier, entry.button)
+        if not takenBinds[key] then
+            table.insert(self.ooc, entry)
+        end
+    end
+
     self:UpdateTooltip()
 end
 
--- Cursor-aware click routing: when a spell is pending on the cursor (SpellIsTargeting),
--- a click should cast that pending spell on the clicked unit instead of Clique's bound action.
--- This has to be combat-safe, which means the secure dispatch must be suppressed from a
--- restricted-environment snippet, not from insecure SetAttribute. We sync targeting state
--- into a custom attribute from events, the PreClick snippet reads it and clears type<button>,
--- the PostClick snippet restores it, and an insecure PostClick handler calls SpellTargetUnit
--- so the pending spell actually fires on the unit.
-
-local CLIQUE_DEBUG = true
-
--- Draggable debug window with an editable, scrollable text area so output can be
--- selected and copied easily. Toggle with /cliquedbg.
-local cliqueDebugFrame
-local cliqueDebugEdit
-local clique_dbg  -- forward declaration so closures below resolve correctly
-local function clique_ensureDebugWindow()
-	if cliqueDebugFrame then return end
-	local f = CreateFrame("Frame", "CliqueDebugFrame", UIParent)
-	f:SetSize(560, 360)
-	f:SetPoint("CENTER")
-	f:SetFrameStrata("DIALOG")
-	f:SetMovable(true)
-	f:EnableMouse(true)
-	f:RegisterForDrag("LeftButton")
-	f:SetScript("OnDragStart", f.StartMoving)
-	f:SetScript("OnDragStop", f.StopMovingOrSizing)
-	f:SetBackdrop({
-		bgFile = "Interface/DialogFrame/UI-DialogBox-Background",
-		edgeFile = "Interface/DialogFrame/UI-DialogBox-Border",
-		tile = true, tileSize = 32, edgeSize = 32,
-		insets = { left = 8, right = 8, top = 8, bottom = 8 },
-	})
-
-	local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	title:SetPoint("TOP", 0, -14)
-	title:SetText("Clique Debug")
-
-	local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
-	closeBtn:SetPoint("TOPRIGHT", -4, -4)
-
-	local clearBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-	clearBtn:SetSize(80, 22)
-	clearBtn:SetPoint("BOTTOMLEFT", 16, 14)
-	clearBtn:SetText("Clear")
-	clearBtn:SetScript("OnClick", function() cliqueDebugEdit:SetText("") end)
-
-	local selBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-	selBtn:SetSize(110, 22)
-	selBtn:SetPoint("LEFT", clearBtn, "RIGHT", 8, 0)
-	selBtn:SetText("Select All")
-	selBtn:SetScript("OnClick", function()
-		cliqueDebugEdit:SetFocus()
-		cliqueDebugEdit:HighlightText()
-	end)
-
-	local testBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-	testBtn:SetSize(140, 22)
-	testBtn:SetPoint("LEFT", selBtn, "RIGHT", 8, 0)
-	testBtn:SetText("Snapshot State")
-	testBtn:SetScript("OnClick", function()
-		clique_dbg("--- snapshot ---")
-		clique_dbg("combat=", tostring(InCombatLockdown()), "targeting(api)=", tostring(SpellIsTargeting()))
-		local n = 0
-		local probed = 0
-		for fr, enabled in pairs(Clique.ccframes or {}) do
-			if enabled and type(fr) == "table" then
-				n = n + 1
-				if fr:GetAttribute("probe-self-canary") ~= nil then
-					probed = probed + 1
-					clique_dbg("frame", fr:GetName() or tostring(fr),
-						"self-canary=", tostring(fr:GetAttribute("probe-self-canary")),
-						"hr-type=", tostring(fr:GetAttribute("probe-hr-type")),
-						"hr-attr=", tostring(fr:GetAttribute("probe-hr-attr")))
-				end
-			end
-		end
-		clique_dbg("total managed frames:", n, "probed:", probed)
-	end)
-
-	local scroll = CreateFrame("ScrollFrame", "CliqueDebugScroll", f, "UIPanelScrollFrameTemplate")
-	scroll:SetPoint("TOPLEFT", 16, -36)
-	scroll:SetPoint("BOTTOMRIGHT", -32, 44)
-
-	local edit = CreateFrame("EditBox", nil, scroll)
-	edit:SetMultiLine(true)
-	edit:SetAutoFocus(false)
-	edit:SetFontObject("ChatFontNormal")
-	edit:SetWidth(scroll:GetWidth())
-	edit:SetMaxLetters(0)
-	edit:SetScript("OnEscapePressed", function() edit:ClearFocus() end)
-	scroll:SetScrollChild(edit)
-	cliqueDebugEdit = edit
-	cliqueDebugFrame = f
-end
-
-clique_dbg = function(...)
-	if not CLIQUE_DEBUG then return end
-	clique_ensureDebugWindow()
-	local parts = {}
-	for i = 1, select("#", ...) do
-		parts[i] = tostring((select(i, ...)))
-	end
-	local line = table.concat(parts, " ")
-	local prev = cliqueDebugEdit:GetText() or ""
-	if #prev > 16000 then
-		prev = prev:sub(-8000)
-	end
-	cliqueDebugEdit:SetText(prev .. line .. "\n")
-	-- Auto-scroll to bottom
-	local scroll = cliqueDebugEdit:GetParent()
-	if scroll and scroll.SetVerticalScroll then
-		scroll:SetVerticalScroll(scroll:GetVerticalScrollRange() + 200)
-	end
-end
-
-SLASH_CLIQUEDBG1 = "/cliquedbg"
-SlashCmdList["CLIQUEDBG"] = function(msg)
-	clique_ensureDebugWindow()
-	if msg == "clear" then
-		cliqueDebugEdit:SetText("")
-	elseif cliqueDebugFrame:IsShown() then
-		cliqueDebugFrame:Hide()
-	else
-		cliqueDebugFrame:Show()
-	end
-end
+-- Cursor-aware click routing: a click on a managed frame builds a macro at PreClick
+-- time that routes the pending cast (if any) and the bound spell through /target +
+-- /cast [@unit], then restores the prior target/focus. See PRECLICK_SNIPPET below.
 
 local cliqueSecureHeader = CreateFrame("Frame", "CliqueSecureHeader", UIParent, "SecureHandlerBaseTemplate")
--- Seed canaries so the probe snippet can detect which access patterns work.
-cliqueSecureHeader:SetAttribute("probe-canary-header", "HEADER-OK")
 
 -- PreClick snippet: dynamically build the macrotext for this click.
 -- Resolves the unit from the frame's "unit" attribute at click time so it
@@ -427,93 +315,25 @@ local PRECLICK_SNIPPET = [[
         focus_tail = "/clearfocus"
     end
 
+    -- DEAD bindings cast only when the unit is a corpse; the conditional makes
+    -- the cast a no-op for living targets, so it can sit on the same key as
+    -- a HELPFUL/HARMFUL binding without conflict.
+    local cast_cond
+    if self:GetAttribute("clique-spell-dead-"..prefix..btn) then
+        cast_cond = "[@"..unit..",dead]"
+    else
+        cast_cond = "[@"..unit.."]"
+    end
+
     local mt = "/clearfocus\n"
         .."/focus [target] target\n"
         .."/target "..unit.."\n"
-        .."/cast [@"..unit.."] "..spell.."\n"
+        .."/cast "..cast_cond.." "..spell.."\n"
         .."/target [@focus,exists] focus\n"
         .."/cleartarget [@focus,noexists]\n"
         ..focus_tail
     self:SetAttribute(prefix.."macrotext"..btn, mt)
-
-    -- Still apply the original cursor-priority routing so the click works.
-    local btn
-    if button == "LeftButton" then btn = "1"
-    elseif button == "RightButton" then btn = "2"
-    elseif button == "MiddleButton" then btn = "3"
-    else btn = string.match(button or "", "^Button(%d+)$") end
-    if btn then
-        local prefix = ""
-        if IsShiftKeyDown() then prefix = "Shift-"..prefix end
-        if IsControlKeyDown() then prefix = "Ctrl-"..prefix end
-        if IsAltKeyDown() then prefix = "Alt-"..prefix end
-        local source_key = UnitExists("focus")
-            and ("clique-mt-focus-"..prefix..btn)
-            or ("clique-mt-nofocus-"..prefix..btn)
-        local mt = self:GetAttribute(source_key)
-        if mt then
-            self:SetAttribute(prefix.."macrotext"..btn, mt)
-        end
-    end
 ]]
-
-local POSTCLICK_SNIPPET = ""
-
--- Insecure PreClick: if a spell is pending on the cursor, fire it on the unit
--- immediately, BEFORE the protected secure dispatch runs. This starts the pending
--- spell's cast. The subsequent secure dispatch of Clique's bound spell will then
--- fail with "Already casting" / GCD, which is the desired outcome: the pending
--- spell goes off, the bound spell does not.
--- Out of combat the secure snippet path additionally suppresses the bound action
--- cleanly, avoiding the visible error message.
-local function clique_PreClick_cast(frame, button)
-	-- No-op: the /target+/cast+/targetlasttarget macro emitted in SetAttribute
-	-- handles cursor consumption inside the secure dispatch, so calling
-	-- SpellTargetUnit here is both redundant and forbidden in combat.
-end
-
--- Snippets to push targeting state into the "clique-targeting" attribute on each
--- managed frame. Combat lockdown blocks SetAttribute from insecure code on protected
--- frames (even for custom names), so we update via SecureHandlerExecute which runs
--- the body in restricted env where attribute writes are permitted.
-local SET_TARGETING_ON_SNIPPET = [[
-    self:SetAttribute("clique-dbg-ran", "on")
-    local count = tonumber(self:GetAttribute("clique-frame-count")) or 0
-    self:SetAttribute("clique-dbg-count", count)
-    local nonnil = 0
-    local wrote = 0
-    for i = 1, count do
-        local f = self:GetFrameRef("clique-frame-"..i)
-        if f then
-            nonnil = nonnil + 1
-            f:SetAttribute("clique-targeting", true)
-            if f:GetAttribute("clique-targeting") then
-                wrote = wrote + 1
-            end
-        end
-    end
-    self:SetAttribute("clique-dbg-nonnil", nonnil)
-    self:SetAttribute("clique-dbg-wrote", wrote)
-]]
-
-local SET_TARGETING_OFF_SNIPPET = [[
-    self:SetAttribute("clique-dbg-ran", "off")
-    local count = tonumber(self:GetAttribute("clique-frame-count")) or 0
-    for i = 1, count do
-        local f = self:GetFrameRef("clique-frame-"..i)
-        if f then f:SetAttribute("clique-targeting", nil) end
-    end
-]]
-
-local cliqueLastTargeting = false
-local cliqueStateFrame = CreateFrame("Frame")
-cliqueStateFrame:RegisterEvent("CURSOR_UPDATE")
-cliqueStateFrame:RegisterEvent("CURRENT_SPELL_CAST_CHANGED")
-cliqueStateFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-cliqueStateFrame:RegisterEvent("SPELLCAST_STOP")
-cliqueStateFrame:RegisterEvent("SPELLCAST_FAILED")
-cliqueStateFrame:RegisterEvent("SPELLCAST_INTERRUPTED")
-cliqueStateFrame:RegisterEvent("PLAYER_FOCUS_CHANGED")
 
 -- Mirror the player's focus identity onto the header so the PreClick
 -- snippet can bake it into the macrotext. The header is unprotected so
@@ -521,47 +341,10 @@ cliqueStateFrame:RegisterEvent("PLAYER_FOCUS_CHANGED")
 local function update_saved_focus()
 	cliqueSecureHeader:SetAttribute("clique-saved-focus-name", UnitName("focus") or "")
 end
-cliqueStateFrame:SetScript("OnEvent", function(self, event)
-	if event == "PLAYER_FOCUS_CHANGED" or event == "PLAYER_ENTERING_WORLD" then
-		update_saved_focus()
-	end
-	local targeting = SpellIsTargeting() and true or false
-	clique_dbg("state event", event, "targeting=", tostring(targeting),
-		"last=", tostring(cliqueLastTargeting), "combat=", tostring(InCombatLockdown()),
-		"saved-focus=", tostring(cliqueSecureHeader:GetAttribute("clique-saved-focus-name")))
-	if targeting == cliqueLastTargeting then return end
-	cliqueLastTargeting = targeting
-	local count = tonumber(cliqueSecureHeader:GetAttribute("clique-frame-count")) or 0
-	clique_dbg("running SecureHandlerExecute, count=", count, "to=", tostring(targeting))
-	local ok, err = pcall(SecureHandlerExecute, cliqueSecureHeader,
-		targeting and SET_TARGETING_ON_SNIPPET or SET_TARGETING_OFF_SNIPPET)
-	clique_dbg("SecureHandlerExecute ok=", tostring(ok), "err=", tostring(err),
-		"ran=", tostring(cliqueSecureHeader:GetAttribute("clique-dbg-ran")),
-		"hdr-count=", tostring(cliqueSecureHeader:GetAttribute("clique-dbg-count")),
-		"nonnil=", tostring(cliqueSecureHeader:GetAttribute("clique-dbg-nonnil")),
-		"wrote=", tostring(cliqueSecureHeader:GetAttribute("clique-dbg-wrote")))
-end)
-
--- Insecure PreClick (runs AFTER the secure PreClick snippet). Use it to verify whether
--- the snippet executed and what state the frame is in.
-local function clique_PreClick_diag(frame, button)
-	if not CLIQUE_DEBUG then return end
-	local suffix
-	if button == "LeftButton" then suffix = "1"
-	elseif button == "RightButton" then suffix = "2"
-	elseif button == "MiddleButton" then suffix = "3" end
-	local prefix = Clique:GetModifierText()
-	local typeAttr = prefix.."type"..(suffix or "?")
-	clique_dbg("PRECLICK(insec)",
-		"frame=", frame:GetName() or tostring(frame),
-		"button=", button,
-		"combat=", tostring(InCombatLockdown()),
-		"targeting(attr)=", tostring(frame:GetAttribute("clique-targeting")),
-		"targeting(api)=", tostring(SpellIsTargeting()),
-		"saved-attr=", tostring(frame:GetAttribute("clique-saved-attr")),
-		"saved-type=", tostring(frame:GetAttribute("clique-saved-type")),
-		typeAttr.."=", tostring(frame:GetAttribute(typeAttr)))
-end
+local cliqueStateFrame = CreateFrame("Frame")
+cliqueStateFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+cliqueStateFrame:RegisterEvent("PLAYER_FOCUS_CHANGED")
+cliqueStateFrame:SetScript("OnEvent", update_saved_focus)
 
 function Clique:RegisterFrame(frame)
 	local name = frame:GetName()
@@ -585,30 +368,9 @@ function Clique:RegisterFrame(frame)
 	-- up out of combat; if we hit this in combat the wrap silently fails and the
 	-- frame falls back to default behavior until next out-of-combat re-registration.
 	if not frame.__clique_hooked and not InCombatLockdown() then
-		local okPre, errPre = pcall(SecureHandlerWrapScript, frame, "PreClick", cliqueSecureHeader, PRECLICK_SNIPPET)
-		local okPost, errPost = pcall(SecureHandlerWrapScript, frame, "PostClick", cliqueSecureHeader, POSTCLICK_SNIPPET)
-		local okInsecPre = pcall(frame.HookScript, frame, "PreClick", clique_PreClick_diag)
-		local okInsecCast = pcall(frame.HookScript, frame, "PreClick", clique_PreClick_cast)
-
-		-- Register this frame as a numbered FrameRef on the header so the
-		-- SecureHandlerExecute snippets can iterate all managed frames and
-		-- push the "clique-targeting" attribute into them in combat.
-		local n = (tonumber(cliqueSecureHeader:GetAttribute("clique-frame-count")) or 0) + 1
-		local okRef = pcall(SecureHandlerSetFrameRef, cliqueSecureHeader, "clique-frame-"..n, frame)
-		if okRef then
-			cliqueSecureHeader:SetAttribute("clique-frame-count", n)
-		end
-
-		-- Probe canaries
-		frame:SetAttribute("probe-canary-self", "SELF-OK")
-		local okSelfRef = pcall(SecureHandlerSetFrameRef, frame, "header", cliqueSecureHeader)
-
+		pcall(SecureHandlerWrapScript, frame, "PreClick", cliqueSecureHeader, PRECLICK_SNIPPET)
+		pcall(SecureHandlerSetFrameRef, frame, "header", cliqueSecureHeader)
 		frame.__clique_hooked = true
-		clique_dbg("RegisterFrame hook", frame:GetName() or tostring(frame), "idx=", n,
-			"securePre=", tostring(okPre), tostring(errPre),
-			"securePost=", tostring(okPost), tostring(errPost),
-			"insecPre=", tostring(okInsecPre), "insecCast=", tostring(okInsecCast),
-			"ref=", tostring(okRef))
 	end
 
 	if frame:CanChangeAttribute() or frame:CanChangeProtectedState() then
@@ -616,6 +378,7 @@ function Clique:RegisterFrame(frame)
 			self:ApplyClickSet(L.CLICKSET_DEFAULT, frame)
 			self:ApplyClickSet(L.CLICKSET_HELPFUL, frame)
 			self:ApplyClickSet(L.CLICKSET_HARMFUL, frame)
+			self:ApplyClickSet(L.CLICKSET_DEAD, frame)
 		else
 			self:ApplyClickSet(L.CLICKSET_DEFAULT, frame)
 			self:ApplyClickSet(self.ooc, frame)
@@ -784,6 +547,7 @@ function Clique:SetAttribute(entry, frame)
 		-- builds the macrotext on the fly. type=macro with an empty default
 		-- macrotext that the snippet fills in.
 		frame:SetAttribute("clique-spell-"..entry.modifier..button, cast)
+		frame:SetAttribute("clique-spell-dead-"..entry.modifier..button, entry.dead and 1 or nil)
 		frame:SetAttribute(entry.modifier.."type"..button, "macro")
 		frame:SetAttribute(entry.modifier.."macrotext"..button, "")
 		frame:SetAttribute(entry.modifier.."macro"..button, nil)
@@ -862,6 +626,8 @@ function Clique:DeleteAttribute(entry, frame)
 
 	frame:SetAttribute(entry.modifier.."type"..button, nil)
 	frame:SetAttribute(entry.modifier..entry.type..button, nil)
+	frame:SetAttribute("clique-spell-"..entry.modifier..button, nil)
+	frame:SetAttribute("clique-spell-dead-"..entry.modifier..button, nil)
 end
 
 function Clique:SetAction(entry)
