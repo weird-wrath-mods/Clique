@@ -205,8 +205,21 @@ function Clique:SpellBookButtonPressed(frame, button)
 	self:PLAYER_REGEN_ENABLED()
 end
 
--- Player is LEAVING combat
-function Clique:PLAYER_REGEN_ENABLED()
+-- Without an OOC set, combat and OOC bindings are the same: no swap at all.
+function Clique:HasOOCSet()
+	return next(self.clicksets[L.CLICKSET_OOC]) ~= nil
+end
+
+-- Player is LEAVING combat. On the real event, frames hold combat bindings, so
+-- only the OOC set and the combat entries it shadows need touching. Explicit
+-- calls (no event arg) come from edits and do the full rebuild.
+function Clique:PLAYER_REGEN_ENABLED(event)
+	if event then
+		if not self:HasOOCSet() then return end
+		self:RemoveClickSet(self.clash)
+		self:ApplyClickSet(L.CLICKSET_OOC)
+		return
+	end
 	self:ApplyClickSet(L.CLICKSET_DEFAULT)
 	self:RemoveClickSet(L.CLICKSET_HARMFUL)
 	self:RemoveClickSet(L.CLICKSET_HELPFUL)
@@ -214,13 +227,12 @@ function Clique:PLAYER_REGEN_ENABLED()
 	self:ApplyClickSet(self.ooc)
 end
 
--- Player is ENTERING combat
+-- Player is ENTERING combat. Frames hold OOC bindings; drop the OOC set and
+-- restore the default/combat entries it shadowed, in stock apply order.
 function Clique:PLAYER_REGEN_DISABLED()
-	self:RemoveClickSet(self.ooc)
-	self:ApplyClickSet(L.CLICKSET_DEFAULT)
-	self:ApplyClickSet(L.CLICKSET_HARMFUL)
-	self:ApplyClickSet(L.CLICKSET_HELPFUL)
-	self:ApplyClickSet(L.CLICKSET_DEAD)
+	if not self:HasOOCSet() then return end
+	self:RemoveClickSet(L.CLICKSET_OOC)
+	self:ApplyClickSet(self.clash)
 end
 
 function Clique:UpdateClicks()
@@ -236,6 +248,9 @@ function Clique:UpdateClicks()
     -- buttons that don't conflict with those defined in OOC.
 
     self.ooc = table.wipe(self.ooc or {})
+    -- Default/combat entries sharing a key with an OOC entry, in combat apply
+    -- order. Everything else is identical in and out of combat.
+    self.clash = table.wipe(self.clash or {})
 
     -- Create a hash map of the "taken" combinations
     local takenBinds = {}
@@ -246,11 +261,19 @@ function Clique:UpdateClicks()
         table.insert(self.ooc, entry)
     end
 
+    for name, entry in pairs(self.clicksets[L.CLICKSET_DEFAULT]) do
+        if takenBinds[string.format("%s:%s", entry.modifier, entry.button)] then
+            table.insert(self.clash, entry)
+        end
+    end
+
     for name, entry in pairs(harm) do
         local button = string.gsub(entry.button, "harmbutton", "")
         local key = string.format("%s:%s", entry.modifier, button)
         if not takenBinds[key] then
             table.insert(self.ooc, entry)
+        else
+            table.insert(self.clash, entry)
         end
     end
 
@@ -259,6 +282,8 @@ function Clique:UpdateClicks()
         local key = string.format("%s:%s", entry.modifier, button)
         if not takenBinds[key] then
             table.insert(self.ooc, entry)
+        else
+            table.insert(self.clash, entry)
         end
     end
 
@@ -266,6 +291,8 @@ function Clique:UpdateClicks()
         local key = string.format("%s:%s", entry.modifier, entry.button)
         if not takenBinds[key] then
             table.insert(self.ooc, entry)
+        else
+            table.insert(self.clash, entry)
         end
     end
 
@@ -501,6 +528,13 @@ function Clique:SetAttribute(entry, frame)
 	end
 
 	button = button or entry.button
+
+	-- The PreClick snippet acts on clique-spell-* and unit whatever the type, so
+	-- a shadowed entry's values would hijack this one's click. Branches that
+	-- need a unit set it again.
+	frame:SetAttribute(entry.modifier.."unit"..button, nil)
+	frame:SetAttribute("clique-spell-"..entry.modifier..button, nil)
+	frame:SetAttribute("clique-spell-dead-"..entry.modifier..button, nil)
 
 	if entry.type == "actionbar" then
 		frame:SetAttribute(entry.modifier.."type"..button, entry.type)
